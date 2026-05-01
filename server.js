@@ -95,6 +95,14 @@ const TELEMETRY_HOSTS = new Set([
   'image6.pubmatic.com','pubmatic.com','rubiconproject.com',
   'criteo.com','sync.go.sonobi.com',
   'btloader.com','adservice.google.com',
+  // additional from observed pages
+  'visualwebsiteoptimizer.com','dev.visualwebsiteoptimizer.com',
+  'cdn.intergient.com','intergient.com',
+  'ck-ie.com','ps.eyeota.net','eyeota.net',
+  'fiftyt.com','id5-sync.com','sync.search.spotxchange.com',
+  'taboola.com','outbrain.com','quantserve.com','scorecardresearch.com',
+  'bidvertiser.com','adsrvr.org','rlcdn.com','adnxs.com',
+  'tapad.com','demdex.net','bluekai.com','bidswitch.net',
 ]);
 
 function isTelemetry(host) {
@@ -139,7 +147,9 @@ function rewriteAttr($el, attr, base) {
   const v = $el.attr(attr);
   if (shouldSkip(v)) return;
   const u = safeURL(v, base);
-  if (u) $el.attr(attr, proxify(u.href));
+  if (!u) return;
+  if (isNamespaceUrl(u.href)) return;
+  $el.attr(attr, proxify(u.href));
 }
 function rewriteSrcset(srcset, base) {
   return srcset.split(',').map(part => {
@@ -166,33 +176,20 @@ function rewriteCss(css, base) {
   return css;
 }
 
-// Pre-pass on raw HTML: rewrite absolute URLs in inline scripts/JSON.
-// Catches hardcoded URLs that the runtime can't intercept (e.g. iframe.src
-// assignments before runtime executes, JSON config blocks, etc.)
-function rewriteInlineAbsoluteUrls(html, finalUrl) {
-  let originHost;
-  try { originHost = new URL(finalUrl).hostname; } catch { return html; }
-
-  // Build a set of related hosts: the upstream + likely related subdomains.
-  // Only rewrite URLs to the same registrable domain to avoid false positives.
-  const parts = originHost.split('.');
-  const reg = parts.slice(-2).join('.'); // crude but works for most TLDs
-
-  // Match http(s)://host/path inside string literals (both " and ')
-  const re = /(["'`])(https?:\/\/([^"'`\s]+))\1/g;
-  return html.replace(re, (m, q, full, rest) => {
-    let host;
-    try { host = new URL(full).hostname; } catch { return m; }
-    if (!host) return m;
-    // Skip telemetry — let those die naturally
-    if (isTelemetry(host)) return m;
-    // Only rewrite same-registrable-domain to be safe with inline JS
-    if (host === originHost || host.endsWith('.' + reg) || host === reg) {
-      return q + proxify(full) + q;
-    }
-    // Also rewrite common CDN patterns the page might reference
-    return q + proxify(full) + q;  // be aggressive — runtime guards downstream
-  });
+// Namespace URLs — these appear in HTML as identifiers, not fetchable URLs.
+// Rewriting them breaks JSON-LD @context, OG metadata, XML namespaces, etc.
+const NAMESPACE_HOSTS = new Set([
+  'schema.org','www.schema.org',
+  'ogp.me','www.ogp.me',
+  'w3.org','www.w3.org',
+  'purl.org','www.purl.org',
+  'xmlns.com','www.xmlns.com',
+  'xml.org','www.xml.org',
+  'opengraphprotocol.org',
+]);
+function isNamespaceUrl(u) {
+  try { return NAMESPACE_HOSTS.has(new URL(u).hostname.toLowerCase()); }
+  catch { return false; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -212,11 +209,14 @@ var REAL_HOST   = (function(){ try { return new URL(REAL).host; } catch(e){ retu
 var REAL_HOSTNAME = (function(){ try { return new URL(REAL).hostname; } catch(e){ return ''; } })();
 var REAL_PROTO  = (function(){ try { return new URL(REAL).protocol; } catch(e){ return 'https:'; } })();
 var PFX = '/p/';
+// Snapshot the proxy's true location BEFORE we spoof — needed for WS routing
+var PROXY_HOST   = window.location.host;
+var PROXY_PROTO  = window.location.protocol;
 
 var _URL = window.URL;
 function isProxyPath(p){ return typeof p==='string' && p.indexOf(PFX)===0; }
 function isProxyAbs(u){
-  try { var x = new _URL(u); return x.host === location.host && x.pathname.indexOf(PFX)===0; }
+  try { var x = new _URL(u); return x.host === PROXY_HOST && x.pathname.indexOf(PFX)===0; }
   catch(e){ return false; }
 }
 function toAbs(u){
@@ -335,8 +335,8 @@ if (_WS) {
         else if (url[0]==='/') abs = REAL_ORIGIN.replace(/^http/, 'ws') + url;
         else abs = REAL_ORIGIN.replace(/^http/, 'ws') + '/' + url;
       }
-      var here = location.protocol==='https:' ? 'wss:' : 'ws:';
-      var routed = here + '//' + location.host + '/ws/' + encodeURIComponent(abs);
+      var here = PROXY_PROTO==='https:' ? 'wss:' : 'ws:';
+      var routed = here + '//' + PROXY_HOST + '/ws/' + encodeURIComponent(abs);
       return protocols ? new _WS(routed, protocols) : new _WS(routed);
     } catch(e){ return new _WS(url, protocols); }
   };
@@ -418,10 +418,14 @@ function hijack(proto, prop){
  ['HTMLFormElement','action'],['HTMLObjectElement','data']
 ].forEach(function(t){ hijack(window[t[0]] && window[t[0]].prototype, t[1]); });
 
-// innerHTML / outerHTML — pre-rewrite the HTML string before parsing
+// innerHTML / outerHTML — pre-rewrite the HTML string before parsing.
+// Only do work if the string actually contains a URL-bearing attribute,
+// otherwise framework virtual-DOM updates trigger huge cost on every render.
 function rewriteHtmlString(s){
-  if (typeof s !== 'string' || s.indexOf('<') === -1) return s;
-  // attribute-style URL rewriting
+  if (typeof s !== 'string') return s;
+  if (s.length < 8) return s;
+  if (s.indexOf('<') === -1) return s;
+  if (!/(?:src|href|action|data|poster|formaction|srcset)\\s*=/i.test(s)) return s;
   return s.replace(/\\b(src|href|action|data|poster|formaction)\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))/gi,
     function(m, attr, _q, dq, sq, uq){
       var val = dq != null ? dq : (sq != null ? sq : uq);
@@ -468,46 +472,28 @@ if (_Blob) {
   window.Blob.prototype = _Blob.prototype;
 }
 
-// MutationObserver catch-all — fix any stray un-proxied URLs added to DOM
+// MutationObserver — fix attributes only (childList scanning was too costly).
+// The setAttribute and property hijacks already cover most cases; this is a
+// safety net for direct attribute writes from compiled code.
 try {
   new MutationObserver(function(muts){
     for (var i=0;i<muts.length;i++) {
       var m = muts[i];
-      if (m.type === 'attributes') {
-        var n = m.attributeName;
-        if (URL_ATTRS[n] || n === 'srcset') {
-          var v = m.target.getAttribute(n);
-          if (!v) continue;
-          if (n === 'srcset') {
-            var nv = rewriteSrcset(v);
-            if (nv !== v) m.target.setAttribute(n, nv);
-          } else if (!isProxyPath(v) && !isProxyAbs(v) && !/^(data:|blob:|javascript:|#|mailto:|tel:|about:)/i.test(v)) {
-            m.target.setAttribute(n, toProxy(v));
-          }
-        }
-      } else if (m.type === 'childList') {
-        m.addedNodes.forEach(function(node){
-          if (node.nodeType !== 1) return;
-          // descend
-          var elts = [node];
-          if (node.querySelectorAll) {
-            try { elts = elts.concat(Array.prototype.slice.call(node.querySelectorAll('[src],[href],[action],[data],[poster],[srcset]'))); } catch(e){}
-          }
-          elts.forEach(function(el){
-            ['src','href','action','data','poster','formaction'].forEach(function(a){
-              var v = el.getAttribute && el.getAttribute(a);
-              if (v && !isProxyPath(v) && !isProxyAbs(v) && !/^(data:|blob:|javascript:|#|mailto:|tel:|about:)/i.test(v)) {
-                try { el.setAttribute(a, toProxy(v)); } catch(e){}
-              }
-            });
-            var ss = el.getAttribute && el.getAttribute('srcset');
-            if (ss) try { el.setAttribute('srcset', rewriteSrcset(ss)); } catch(e){}
-          });
-        });
+      if (m.type !== 'attributes') continue;
+      var n = m.attributeName;
+      var v = m.target.getAttribute(n);
+      if (!v) continue;
+      if (n === 'srcset') {
+        var nv = rewriteSrcset(v);
+        if (nv !== v) m.target.setAttribute(n, nv);
+      } else if (URL_ATTRS[n]) {
+        if (isProxyPath(v) || isProxyAbs(v)) continue;
+        if (/^(data:|blob:|javascript:|#|mailto:|tel:|about:)/i.test(v)) continue;
+        try { m.target.setAttribute(n, toProxy(v)); } catch(e){}
       }
     }
   }).observe(document.documentElement || document, {
-    subtree: true, childList: true, attributes: true,
+    subtree: true, attributes: true,
     attributeFilter: ['src','href','action','data','poster','formaction','srcset']
   });
 } catch(e){}
@@ -542,27 +528,7 @@ document.addEventListener('submit', function(e){
   } catch(err){}
 }, true);
 
-// postMessage event spoofing
-try {
-  window.addEventListener('message', function(){}, true);
-  var origAdd = EventTarget.prototype.addEventListener;
-  EventTarget.prototype.addEventListener = function(type, listener, opts){
-    if (type === 'message' && typeof listener === 'function') {
-      var wrapped = function(ev){
-        try {
-          // expose origin/source as if from real upstream
-          if (ev && typeof ev.origin === 'string' && ev.origin === location.origin) {
-            try { Object.defineProperty(ev, 'origin', { configurable:true, get: function(){ return REAL_ORIGIN; } }); } catch(e){}
-          }
-        } catch(e){}
-        return listener.call(this, ev);
-      };
-      try { listener.__wrapped = wrapped; } catch(e){}
-      return origAdd.call(this, type, wrapped, opts);
-    }
-    return origAdd.call(this, type, listener, opts);
-  };
-} catch(e){}
+// (postMessage origin spoofing removed — caused more breakage than fixes)
 
 // anti-detection
 try { Object.defineProperty(navigator,'webdriver',{ configurable:true, get:function(){ return false; } }); } catch(e){}
@@ -586,9 +552,6 @@ function patchFrameWindow(w){
 // HTML rewrite (full)
 // ─────────────────────────────────────────────────────────────────────────────
 function rewriteHtml(html, finalUrl) {
-  // Pre-pass: rewrite absolute URLs in inline scripts/JSON
-  html = rewriteInlineAbsoluteUrls(html, finalUrl);
-
   const $ = cheerio.load(html, { decodeEntities: false });
   const base = finalUrl;
 
@@ -623,8 +586,9 @@ function rewriteHtml(html, finalUrl) {
     if (css) $(el).html(rewriteCss(css, base));
   });
 
+  // SRI hashes won't match rewritten URLs — strip them
   $('[integrity]').removeAttr('integrity');
-  $('[crossorigin]').removeAttr('crossorigin');
+  // keep crossorigin — fonts and modules need it
 
   // strip CSP <meta>
   $('meta[http-equiv]').each((_, el) => {
@@ -855,9 +819,8 @@ async function streamUpstream(targetUrl, req, res) {
     return res.status(204).end();
   }
 
-  // HTML cache lookup (GET only, no auth)
-  const cookieKey = (req.headers.cookie || '').slice(0, 64);
-  const cacheKey = req.method === 'GET' ? `${parsedUrl.href}|${cookieKey}` : null;
+  // HTML cache lookup (GET only). Cookie not in key — it changes too often.
+  const cacheKey = req.method === 'GET' ? parsedUrl.href : null;
   if (cacheKey) {
     const cached = cacheGet(cacheKey);
     if (cached) {
@@ -876,7 +839,20 @@ async function streamUpstream(targetUrl, req, res) {
   }
 
   let upstream;
-  try { upstream = await fetchUp(parsedUrl.href, opts); }
+  try {
+    upstream = await fetchUp(parsedUrl.href, opts);
+    // 429 / 503: brief retry with no cookies (anonymous-looking)
+    if ((upstream.status === 429 || upstream.status === 503) && req.method === 'GET') {
+      await new Promise(r => setTimeout(r, 400));
+      const retryHeaders = { ...headers };
+      delete retryHeaders.Cookie; delete retryHeaders.cookie;
+      retryHeaders['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+      try {
+        const retry = await fetchUp(parsedUrl.href, { ...opts, headers: retryHeaders });
+        if (retry.status < 400) upstream = retry;
+      } catch {}
+    }
+  }
   catch (err) {
     console.error(`[proxy] FAIL ${req.method} ${parsedUrl.href} — ${err.message}`);
     return sendError(res, 502, err.message, parsedUrl.href, req);
