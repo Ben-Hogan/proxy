@@ -79,68 +79,24 @@ function rewriteCss(css, base) {
 
 // Injected into every proxied HTML page. Intercepts navigation, fetch, XHR,
 // history mutations, and form submissions so SPA navigation stays proxied.
+// Uses JSON.stringify for safe URL embedding and string-based injection to
+// avoid cheerio entity-encoding script content.
 function injectedScript(baseUrl) {
-  const safe = baseUrl.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-  return `<script>(function(){
-var BASE='${safe}',PROXY='/proxy?url=';
-function p(u){if(!u||/^(data:|blob:|javascript:)/.test(u))return u;try{return PROXY+encodeURIComponent(new URL(u,BASE).href);}catch(e){return u;}}
-
-// ── fetch ──
-var _f=window.fetch;
-window.fetch=function(input,init){
-  if(typeof input==='string')input=p(input);
-  else if(input instanceof Request){
-    var u=p(input.url);
-    if(u!==input.url)input=new Request(u,input);
-  }
-  return _f.call(this,input,init);
-};
-
-// ── XMLHttpRequest ──
-var _X=window.XMLHttpRequest;
-window.XMLHttpRequest=function(){
-  var x=new _X(),_open=x.open.bind(x);
-  x.open=function(m,u){_open(m,p(u));};
-  return x;
-};
-
-// ── history ──
-function wh(fn){return function(state,title,url){
-  if(url&&typeof url==='string'&&!url.startsWith('/proxy')){
-    try{url=PROXY+encodeURIComponent(new URL(url,BASE).href);}catch(e){}
-  }
-  return fn.call(history,state,title,url);
-};}
-history.pushState=wh(history.pushState);
-history.replaceState=wh(history.replaceState);
-
-// ── link click catch-all ──
-document.addEventListener('click',function(e){
-  var el=e.target.closest('a[href]');
-  if(!el)return;
-  var h=el.getAttribute('href');
-  if(!h||/^(javascript:|#|mailto:|tel:)/.test(h))return;
-  e.preventDefault();
-  try{window.location.href=PROXY+encodeURIComponent(new URL(h,BASE).href);}catch(err){}
-},true);
-
-// ── form submission ──
-document.addEventListener('submit',function(e){
-  var form=e.target;
-  var action=form.getAttribute('action')||BASE;
-  var method=(form.method||'get').toUpperCase();
-  try{
-    var url=new URL(action,BASE);
-    if(method==='GET'){
-      new FormData(form).forEach(function(v,k){url.searchParams.append(k,v);});
-      e.preventDefault();
-      window.location.href=PROXY+encodeURIComponent(url.href);
-    } else {
-      form.action=PROXY+encodeURIComponent(url.href);
-    }
-  }catch(err){}
-},true);
-})();</script>`;
+  const baseJson = JSON.stringify(baseUrl)
+    .replace(/<\/script>/gi, '<\\/script>')
+    .replace(/<!--/g, '<\\!--');
+  return `<script>(function(){var BASE=${baseJson},P='/proxy?url=';`
+    + `function r(u){if(!u||/^(data:|blob:|javascript:)/.test(u))return u;`
+    + `try{return P+encodeURIComponent(new URL(u,BASE).href);}catch(e){return u;}}`
+    + `var _f=window.fetch;`
+    + `window.fetch=function(i,o){if(typeof i==='string')i=r(i);else if(i&&i.url){var u=r(i.url);if(u!==i.url)i=new Request(u,i);}return _f.call(this,i,o);};`
+    + `var _X=window.XMLHttpRequest;`
+    + `window.XMLHttpRequest=function(){var x=new _X(),_o=x.open.bind(x);x.open=function(m,u){_o(m,r(u));};return x;};`
+    + `function wh(fn){return function(s,t,u){if(u&&typeof u==='string'&&u.indexOf('/proxy')){try{u=P+encodeURIComponent(new URL(u,BASE).href);}catch(e){}}return fn.call(history,s,t,u);};}`
+    + `history.pushState=wh(history.pushState);history.replaceState=wh(history.replaceState);`
+    + `document.addEventListener('click',function(e){var el=e.target.closest('a[href]');if(!el)return;var h=el.getAttribute('href');if(!h||h[0]==='#'||/^(javascript:|mailto:|tel:)/.test(h))return;e.preventDefault();try{location.href=P+encodeURIComponent(new URL(h,BASE).href);}catch(x){}},true);`
+    + `document.addEventListener('submit',function(e){var f=e.target,a=f.getAttribute('action')||BASE,m=(f.method||'get').toUpperCase();try{var u=new URL(a,BASE);if(m==='GET'){new FormData(f).forEach(function(v,k){u.searchParams.append(k,v);});e.preventDefault();location.href=P+encodeURIComponent(u.href);}else{f.action=P+encodeURIComponent(u.href);}}catch(x){}},true);`
+    + `})();<\/script>`;
 }
 
 // ── HTML rewriting ────────────────────────────────────────────────────────────
@@ -150,10 +106,6 @@ function rewriteHtml(html, base) {
 
   // Remove <base> so relative URLs resolve against our proxy URL
   $('base').remove();
-
-  // Inject interception script as early as possible
-  $('head').prepend(injectedScript(base));
-  if (!$('head').length) $('html').prepend(`<head>${injectedScript(base)}</head>`);
 
   // href attributes
   $('a[href], link[href]').each((_, el) => rewriteAttr($(el), 'href', base));
@@ -197,7 +149,18 @@ function rewriteHtml(html, base) {
     if (css) $(el).html(rewriteCss(css, base));
   });
 
-  return $.html();
+  let out = $.html();
+
+  // Inject via string replace so cheerio never touches the script content
+  const headMatch = out.match(/<head[^>]*>/i);
+  if (headMatch) {
+    const idx = out.indexOf(headMatch[0]) + headMatch[0].length;
+    out = out.slice(0, idx) + injectedScript(base) + out.slice(idx);
+  } else {
+    out = injectedScript(base) + out;
+  }
+
+  return out;
 }
 
 // ── landing page ──────────────────────────────────────────────────────────────
