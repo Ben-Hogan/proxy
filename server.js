@@ -200,17 +200,25 @@ button:hover{background:#3a8eff}
   <p class="tip">You can also append a URL as a hash: <code>this-domain.com#https://site.com</code></p>
 </div>
 <script>
-function go(){
-  var u=document.getElementById('u').value.trim();
-  if(!u)return;
-  if(!/^https?:\/\//i.test(u))u='https://'+u;
-  window.location.href='/proxy?url='+encodeURIComponent(u);
+function ensureProto(s){
+  s = s.trim();
+  if (!s) return '';
+  var lower = s.toLowerCase();
+  if (lower.indexOf('http://') === 0 || lower.indexOf('https://') === 0) return s;
+  return 'https://' + s;
 }
-document.getElementById('u').addEventListener('keydown',function(e){if(e.key==='Enter')go();});
-var h=location.hash.slice(1);
-if(h){
-  if(!/^https?:\/\//i.test(h))h='https://'+h;
-  document.getElementById('u').value=h;
+function go(){
+  var u = ensureProto(document.getElementById('u').value);
+  if (!u) return;
+  window.location.href = '/proxy?url=' + encodeURIComponent(u);
+}
+document.getElementById('u').addEventListener('keydown', function(e){
+  if (e.key === 'Enter') go();
+});
+var h = location.hash.slice(1);
+if (h) {
+  var fixed = ensureProto(h);
+  document.getElementById('u').value = fixed;
   go();
 }
 </script>
