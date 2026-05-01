@@ -254,16 +254,16 @@ if(h){
 </body>
 </html>`;
 
-// ── proxy route ───────────────────────────────────────────────────────────────
+// ── routes ────────────────────────────────────────────────────────────────────
 
 app.get('/', (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(LANDING);
 });
 
-// Accept all methods so POST forms and API calls work
-app.use('/proxy', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
+async function handleProxy(req, res) {
   const targetUrl = req.query.url;
+  console.log(`[proxy] ${req.method} ${targetUrl || '(no url)'}`);
   if (!targetUrl) return res.redirect('/');
 
   let parsedUrl;
@@ -290,7 +290,7 @@ app.use('/proxy', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) 
     signal:  AbortSignal.timeout(20000),
   };
 
-  if (!['GET', 'HEAD'].includes(req.method) && req.body && req.body.length > 0) {
+  if (!['GET', 'HEAD'].includes(req.method) && req.body instanceof Buffer && req.body.length > 0) {
     fetchOptions.body = req.body;
   }
 
@@ -352,6 +352,15 @@ app.use('/proxy', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) 
       <p><a href="/" style="color:#4a9eff">← Back</a></p>
       </body></html>`);
   }
-});
+}
+
+// GET/HEAD go straight through
+app.get('/proxy', handleProxy);
+app.head('/proxy', handleProxy);
+
+// POST/PUT/PATCH etc. need body parsing first
+app.post('/proxy', express.raw({ type: '*/*', limit: '50mb' }), handleProxy);
+app.put('/proxy', express.raw({ type: '*/*', limit: '50mb' }), handleProxy);
+app.patch('/proxy', express.raw({ type: '*/*', limit: '50mb' }), handleProxy);
 
 app.listen(PORT, () => console.log(`Proxy listening on port ${PORT}`));
