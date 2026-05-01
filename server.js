@@ -669,19 +669,17 @@ button:hover{background:#3a8eff}
   <p class="tip">URL hash works too: <code>this-domain.com#site.com</code></p>
 </div>
 <script>
-// Detect URL vs search query.
-// URL if: has scheme, OR is "host[:port][/path]" with a TLD-shaped suffix or
-// is an IP, OR is localhost. Otherwise → search.
-var TLD_RE = /\.[a-z]{2,24}(?:[/:?#]|$)/i;
-var IP_RE  = /^\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?(?:[/?#].*)?$/;
+// Detect URL vs search query — backslashes doubled because this lives inside
+// a JS template literal in server.js (\d would otherwise become d, etc.)
+var TLD_RE = /\\.[a-z]{2,24}(?:[/:?#]|$)/i;
+var IP_RE  = /^\\d{1,3}(?:\\.\\d{1,3}){3}(?::\\d+)?(?:[/?#].*)?$/;
 function looksLikeUrl(s){
   s = (s||'').trim();
   if (!s) return false;
-  if (/\s/.test(s)) return false;          // spaces => clearly a query
-  if (/^https?:\/\//i.test(s)) return true;
-  if (/^(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(s)) return true;
+  if (/\\s/.test(s)) return false;
+  if (/^https?:\\/\\//i.test(s)) return true;
+  if (/^(localhost|127\\.0\\.0\\.1)(:\\d+)?(\\/|$)/.test(s)) return true;
   if (IP_RE.test(s)) return true;
-  // host[:port][/...] form, e.g. "example.com" or "sub.foo.io/bar"
   var first = s.split(/[/?#]/)[0];
   if (TLD_RE.test(first + '/')) return true;
   return false;
@@ -690,7 +688,7 @@ function go(){
   var raw = (document.getElementById('u').value || '').trim();
   if (!raw) return;
   if (looksLikeUrl(raw)) {
-    var u = /^https?:\/\//i.test(raw) ? raw : 'https://' + raw;
+    var u = /^https?:\\/\\//i.test(raw) ? raw : 'https://' + raw;
     window.location.href = '/p/' + u;
   } else {
     window.location.href = '/search?q=' + encodeURIComponent(raw);
