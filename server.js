@@ -661,29 +661,48 @@ button:hover{background:#3a8eff}
 <body>
 <div class="card">
   <h1>Proxy</h1>
-  <p>Browse any website through this proxy.</p>
+  <p>Type a URL or anything to search.</p>
   <div class="row">
-    <input id="u" type="text" placeholder="https://example.com" autofocus>
+    <input id="u" type="text" placeholder="site.com  or  search the web" autofocus>
     <button id="btn">Go</button>
   </div>
-  <p class="tip">Append a URL as a hash: <code>this-domain.com#site.com</code></p>
+  <p class="tip">URL hash works too: <code>this-domain.com#site.com</code></p>
 </div>
 <script>
-function ensureProto(s){
-  s=(s||'').trim(); if(!s) return '';
-  var l=s.toLowerCase();
-  if (l.indexOf('http://')===0 || l.indexOf('https://')===0) return s;
-  return 'https://'+s;
+// Detect URL vs search query.
+// URL if: has scheme, OR is "host[:port][/path]" with a TLD-shaped suffix or
+// is an IP, OR is localhost. Otherwise → search.
+var TLD_RE = /\.[a-z]{2,24}(?:[/:?#]|$)/i;
+var IP_RE  = /^\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?(?:[/?#].*)?$/;
+function looksLikeUrl(s){
+  s = (s||'').trim();
+  if (!s) return false;
+  if (/\s/.test(s)) return false;          // spaces => clearly a query
+  if (/^https?:\/\//i.test(s)) return true;
+  if (/^(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(s)) return true;
+  if (IP_RE.test(s)) return true;
+  // host[:port][/...] form, e.g. "example.com" or "sub.foo.io/bar"
+  var first = s.split(/[/?#]/)[0];
+  if (TLD_RE.test(first + '/')) return true;
+  return false;
 }
 function go(){
-  var u=ensureProto(document.getElementById('u').value);
-  if(!u) return;
-  window.location.href = '/p/' + u;
+  var raw = (document.getElementById('u').value || '').trim();
+  if (!raw) return;
+  if (looksLikeUrl(raw)) {
+    var u = /^https?:\/\//i.test(raw) ? raw : 'https://' + raw;
+    window.location.href = '/p/' + u;
+  } else {
+    window.location.href = '/search?q=' + encodeURIComponent(raw);
+  }
 }
 document.getElementById('btn').addEventListener('click', go);
 document.getElementById('u').addEventListener('keydown', function(e){ if(e.key==='Enter') go(); });
-var h=location.hash.slice(1);
-if (h) { document.getElementById('u').value=ensureProto(h); go(); }
+var h = location.hash.slice(1);
+if (h) {
+  document.getElementById('u').value = h;
+  go();
+}
 </script>
 </body>
 </html>`;
@@ -719,6 +738,14 @@ app.disable('x-powered-by');
 app.get('/', (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(LANDING);
+});
+
+// /search?q=... → proxy redirect to DuckDuckGo HTML results
+app.get('/search', (req, res) => {
+  const q = (req.query.q || '').toString().trim();
+  if (!q) return res.redirect('/');
+  const target = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q);
+  res.redirect('/p/' + target);
 });
 
 // CORS preflight passthrough
@@ -913,7 +940,13 @@ async function streamUpstream(targetUrl, req, res) {
 // /p/<url>
 app.all(/^\/p\/.+/, async (req, res) => {
   const target = decodeProxyPath(req.originalUrl);
-  if (!target) return res.redirect('/');
+  if (!target) {
+    // Not a URL after the /p/ — treat as a search query
+    const stray = req.originalUrl.slice(3).replace(/^\/+/, '');
+    let decoded = stray;
+    try { decoded = decodeURIComponent(stray); } catch {}
+    return res.redirect('/search?q=' + encodeURIComponent(decoded));
+  }
   await streamUpstream(target, req, res);
 });
 
