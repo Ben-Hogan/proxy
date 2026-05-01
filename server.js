@@ -4,6 +4,8 @@ const express = require('express');
 const cheerio = require('cheerio');
 const http    = require('http');
 const tls     = require('tls');
+const fs      = require('fs');
+const path    = require('path');
 const { WebSocketServer, WebSocket } = require('ws');
 const { Readable, PassThrough } = require('stream');
 const { Agent, ProxyAgent, fetch: undiciFetch, setGlobalDispatcher, buildConnector } = require('undici');
@@ -706,6 +708,159 @@ if (h) {
 </html>`;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Visit log — records top-level page navigations (HTML responses only).
+// Persisted to disk every 10s and on graceful shutdown so Railway restarts
+// don't wipe history. Bounded to 5000 entries.
+// ─────────────────────────────────────────────────────────────────────────────
+const VISITS_FILE = process.env.VISITS_FILE || path.join(__dirname, 'visits.json');
+const MAX_VISITS = 5000;
+const visits = new Map(); // key: origin+path → { url, host, title, count, first, last }
+
+try {
+  if (fs.existsSync(VISITS_FILE)) {
+    const data = JSON.parse(fs.readFileSync(VISITS_FILE, 'utf8'));
+    for (const entry of data) visits.set(entry.url, entry);
+    console.log(`[visits] loaded ${visits.size} from disk`);
+  }
+} catch (e) { console.error('[visits] load failed:', e.message); }
+
+let visitsDirty = false;
+function recordVisit(url, host) {
+  const key = url;
+  const now = Date.now();
+  const existing = visits.get(key);
+  if (existing) {
+    existing.count++;
+    existing.last = now;
+  } else {
+    if (visits.size >= MAX_VISITS) {
+      // evict oldest
+      const oldest = [...visits.entries()].sort((a, b) => a[1].last - b[1].last)[0];
+      if (oldest) visits.delete(oldest[0]);
+    }
+    visits.set(key, { url, host, title: '', count: 1, first: now, last: now });
+  }
+  visitsDirty = true;
+}
+function setVisitTitle(url, title) {
+  const e = visits.get(url);
+  if (e && title && title !== e.title) { e.title = title.slice(0, 200); visitsDirty = true; }
+}
+function flushVisits() {
+  if (!visitsDirty) return;
+  try {
+    fs.writeFileSync(VISITS_FILE, JSON.stringify([...visits.values()]), 'utf8');
+    visitsDirty = false;
+  } catch (e) { console.error('[visits] save failed:', e.message); }
+}
+setInterval(flushVisits, 10_000).unref();
+process.on('SIGTERM', flushVisits);
+process.on('SIGINT',  () => { flushVisits(); process.exit(0); });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /data page renderer
+// ─────────────────────────────────────────────────────────────────────────────
+function escapeHtml(s) {
+  return String(s || '').replace(/[<>&"']/g, c =>
+    ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function fmtTime(t) {
+  const d = new Date(t);
+  const diff = Date.now() - t;
+  if (diff < 60_000)        return Math.floor(diff/1000) + 's ago';
+  if (diff < 3_600_000)     return Math.floor(diff/60_000) + 'm ago';
+  if (diff < 86_400_000)    return Math.floor(diff/3_600_000) + 'h ago';
+  if (diff < 30 * 86_400_000) return Math.floor(diff/86_400_000) + 'd ago';
+  return d.toLocaleDateString();
+}
+function DATA_PAGE(list) {
+  const rows = list.map(e => {
+    const href  = '/p/' + e.url;
+    const url   = escapeHtml(e.url);
+    const host  = escapeHtml(e.host);
+    const title = escapeHtml(e.title || e.host);
+    const last  = fmtTime(e.last);
+    const count = e.count;
+    return `<a class="row" href="${href}" data-search="${escapeHtml((e.url+' '+e.host+' '+(e.title||'')).toLowerCase())}">
+      <div class="cell-title">
+        <div class="title">${title}</div>
+        <div class="url">${url}</div>
+      </div>
+      <div class="cell-meta">
+        <span class="host">${host}</span>
+        <span class="count">${count}×</span>
+        <span class="time">${last}</span>
+      </div>
+    </a>`;
+  }).join('');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proxy History (${list.length})</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d0d0d;color:#e0e0e0;font-family:system-ui,-apple-system,sans-serif;padding:24px;min-height:100vh}
+.head{display:flex;align-items:center;gap:12px;max-width:1100px;margin:0 auto 18px;flex-wrap:wrap}
+.head h1{font-size:1.4rem;font-weight:700;color:#fff;letter-spacing:-.02em}
+.head .count{color:#888;font-size:.9rem}
+.head a{color:#4a9eff;text-decoration:none;font-size:.9rem}
+.head a:hover{text-decoration:underline}
+.head form{margin-left:auto}
+.head button{padding:7px 12px;background:#222;border:1px solid #333;border-radius:7px;color:#aaa;font-size:.85rem;cursor:pointer}
+.head button:hover{background:#2a2a2a;color:#fff}
+.search{max-width:1100px;margin:0 auto 16px}
+.search input{width:100%;padding:11px 14px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:9px;color:#e0e0e0;font-size:15px;outline:none}
+.search input:focus{border-color:#4a9eff}
+.list{max-width:1100px;margin:0 auto;display:flex;flex-direction:column;gap:4px}
+.row{display:flex;align-items:center;gap:16px;padding:12px 14px;background:#161616;border:1px solid #232323;border-radius:9px;text-decoration:none;color:inherit;transition:background .12s,border-color .12s}
+.row:hover{background:#1c1c1c;border-color:#333}
+.cell-title{flex:1;min-width:0}
+.title{font-size:.95rem;color:#e0e0e0;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.url{font-size:.78rem;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;font-family:ui-monospace,SF Mono,Menlo,monospace}
+.cell-meta{display:flex;gap:14px;flex-shrink:0;font-size:.8rem;color:#666;align-items:center}
+.host{color:#888;font-family:ui-monospace,SF Mono,Menlo,monospace}
+.count{background:#222;padding:2px 8px;border-radius:11px;color:#aaa;font-variant-numeric:tabular-nums}
+.time{color:#555;font-variant-numeric:tabular-nums;min-width:60px;text-align:right}
+.empty{max-width:600px;margin:60px auto;text-align:center;color:#666}
+.empty h2{color:#aaa;margin-bottom:8px}
+@media (max-width:640px){.url{display:none}.host{display:none}}
+</style>
+</head>
+<body>
+<div class="head">
+  <h1>History</h1>
+  <span class="count">${list.length} site${list.length===1?'':'s'}</span>
+  <a href="/">← Home</a>
+  <a href="/data?format=json">JSON</a>
+  <form method="POST" action="/data/clear" onsubmit="return confirm('Clear all history?')">
+    <button type="submit">Clear</button>
+  </form>
+</div>
+<div class="search">
+  <input id="q" type="text" placeholder="Filter by url, host, or title…" autofocus>
+</div>
+<div class="list" id="list">
+  ${list.length ? rows : '<div class="empty"><h2>No visits yet</h2><p>Browse a site to see it here.</p></div>'}
+</div>
+<script>
+var input = document.getElementById('q');
+var rows  = document.querySelectorAll('.row');
+input.addEventListener('input', function(){
+  var q = input.value.trim().toLowerCase();
+  for (var i = 0; i < rows.length; i++) {
+    var hay = rows[i].dataset.search || '';
+    rows[i].style.display = (!q || hay.indexOf(q) !== -1) ? '' : 'none';
+  }
+});
+</script>
+</body>
+</html>`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // In-memory HTML cache (LRU-ish)
 // ─────────────────────────────────────────────────────────────────────────────
 const HTML_CACHE = new Map();
@@ -744,6 +899,25 @@ app.get('/search', (req, res) => {
   if (!q) return res.redirect('/');
   const target = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q);
   res.redirect('/p/' + target);
+});
+
+// /data — list every URL visited through the proxy. JSON when ?format=json.
+app.get('/data', (req, res) => {
+  const list = [...visits.values()].sort((a, b) => b.last - a.last);
+  if (req.query.format === 'json') {
+    res.setHeader('Content-Type', 'application/json');
+    return res.send(JSON.stringify(list));
+  }
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(DATA_PAGE(list));
+});
+
+// /data/clear → wipe the visit log
+app.post('/data/clear', (req, res) => {
+  visits.clear();
+  visitsDirty = true;
+  flushVisits();
+  res.redirect('/data');
 });
 
 // CORS preflight passthrough
@@ -849,6 +1023,10 @@ async function streamUpstream(targetUrl, req, res) {
   if (cacheKey) {
     const cached = cacheGet(cacheKey);
     if (cached) {
+      const dest = (req.headers['sec-fetch-dest'] || '').toLowerCase();
+      if (!dest || dest === 'document' || dest === 'iframe') {
+        try { recordVisit(parsedUrl.href, parsedUrl.hostname); } catch {}
+      }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.setHeader('X-Cache', 'HIT');
       res.setHeader('Access-Control-Allow-Origin', '*');
@@ -912,7 +1090,22 @@ async function streamUpstream(targetUrl, req, res) {
 
   if (ctype.includes('text/html')) {
     const html = await upstream.text();
-    const rewritten = rewriteHtml(html, upstream.url || parsedUrl.href);
+    const finalUrl = upstream.url || parsedUrl.href;
+    // Only log top-level navigations (sec-fetch-dest=document or no header)
+    const dest = (req.headers['sec-fetch-dest'] || '').toLowerCase();
+    const isTopLevel = !dest || dest === 'document' || dest === 'iframe';
+    if (isTopLevel && req.method === 'GET' && upstream.status < 400) {
+      try {
+        const u = new URL(finalUrl);
+        recordVisit(finalUrl, u.hostname);
+        const tm = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+        if (tm) {
+          const title = tm[1].replace(/\s+/g, ' ').trim();
+          if (title) setVisitTitle(finalUrl, title);
+        }
+      } catch {}
+    }
+    const rewritten = rewriteHtml(html, finalUrl);
     if (cacheKey && upstream.status === 200) cacheSet(cacheKey, rewritten);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('X-Cache', 'MISS');
